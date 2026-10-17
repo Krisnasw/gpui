@@ -4152,13 +4152,15 @@ impl Window {
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill. A drop shadow is
-    /// clipped to outside `bounds`, so a translucent fill never shows it through.
+    /// clipped to outside `bounds`, whose corners are smoothed by `corner_smoothing`, so a
+    /// translucent fill never shows it through.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_drop_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
@@ -4183,7 +4185,7 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 0,
-                pad: 0,
+                element_corner_smoothing: corner_smoothing,
             });
         }
     }
@@ -4191,10 +4193,12 @@ impl Window {
     /// Paint the inset shadows from `shadows` into the scene at the current z-index. Should
     /// be called after the element's background so the shadow layers on top of the fill.
     /// Drop shadows are skipped; paint those with [`Self::paint_drop_shadows`] before the background.
+    /// The shadows stay inside `bounds`, whose corners are smoothed by `corner_smoothing`.
     pub fn paint_inset_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
         shadows: &[BoxShadow],
     ) {
         self.invalidator.debug_assert_paint();
@@ -4228,13 +4232,20 @@ impl Window {
                 element_bounds,
                 element_corner_radii,
                 inset: 1,
-                pad: 0,
+                element_corner_smoothing: corner_smoothing,
             });
         }
     }
 
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
-        let radii = &quad.corner_radii;
+        // A smoothed corner starts further along each edge than its radius.
+        let reach = 1.0 + SQUIRCLE_REACH * quad.corner_smoothing.clamp(0.0, 1.0);
+        let radii = &Corners {
+            top_left: quad.corner_radii.top_left * reach,
+            top_right: quad.corner_radii.top_right * reach,
+            bottom_right: quad.corner_radii.bottom_right * reach,
+            bottom_left: quad.corner_radii.bottom_left * reach,
+        };
         let widths = &quad.border_widths;
         let edge_radii = Edges {
             top: radii.top_left.max(radii.top_right),
@@ -4319,11 +4330,13 @@ impl Window {
 
         let element_bounds = bounds.scale(scale_factor);
         let transform_origin = match grows_from {
-            Some(origin) => element_bounds.origin
-                + point(
-                    element_bounds.size.width * origin.x,
-                    element_bounds.size.height * origin.y,
-                ),
+            Some(origin) => {
+                element_bounds.origin
+                    + point(
+                        element_bounds.size.width * origin.x,
+                        element_bounds.size.height * origin.y,
+                    )
+            }
             None => element_bounds.center(),
         };
         let fades = filter.fade_top + filter.fade_bottom + filter.fade_left + filter.fade_right;
@@ -4349,6 +4362,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
         blur: Pixels,
     ) {
         self.invalidator.debug_assert_paint();
@@ -4360,7 +4374,7 @@ impl Window {
         let scale_factor = self.scale_factor();
         self.next_frame.scene.insert_primitive(Backdrop {
             order: 0,
-            pad: 0,
+            corner_smoothing,
             blur: blur.0 * scale_factor,
             opacity: self.element_opacity(),
             bounds: self.snap_bounds(bounds),
@@ -4392,6 +4406,8 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            corner_smoothing: quad.corner_smoothing,
+            pad: 0,
         };
 
         if !quad.background.is_transparent() {
@@ -7074,9 +7090,20 @@ pub struct PaintQuad {
     pub border_color: Hsla,
     /// The style of the quad's borders.
     pub border_style: BorderStyle,
+    /// How far the corners are smoothed from circular arcs towards a squircle, from 0 to 1.
+    /// See [`crate::Styled::corner_smoothing`].
+    pub corner_smoothing: f32,
 }
 
 impl PaintQuad {
+    /// Sets how far the quad's corners are smoothed towards a squircle, from 0 to 1.
+    pub fn corner_smoothing(self, corner_smoothing: f32) -> Self {
+        PaintQuad {
+            corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
+            ..self
+        }
+    }
+
     /// Sets the corner radii of the quad.
     pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
         PaintQuad {
@@ -7110,6 +7137,11 @@ impl PaintQuad {
     }
 }
 
+/// How much further along each edge a fully smoothed corner starts than a round one, as a share
+/// of its radius. The shaders shape a corner over this length so that it meets the round corner of
+/// the same radius at its middle, the way the continuous corners of iOS do.
+pub(crate) const SQUIRCLE_REACH: f32 = 0.528_665;
+
 /// Creates a quad with the given parameters.
 pub fn quad(
     bounds: Bounds<Pixels>,
@@ -7126,6 +7158,7 @@ pub fn quad(
         border_widths: border_widths.into(),
         border_color: border_color.into(),
         border_style,
+        corner_smoothing: 0.,
     }
 }
 
@@ -7138,6 +7171,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         border_widths: (0.).into(),
         border_color: transparent_black(),
         border_style: BorderStyle::default(),
+        corner_smoothing: 0.,
     }
 }
 
@@ -7154,6 +7188,7 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+        corner_smoothing: 0.,
     }
 }
 
