@@ -210,6 +210,10 @@ name = "shadow"
 path = "examples/shadow.rs"
 
 [[example]]
+name = "squircle"
+path = "examples/squircle.rs"
+
+[[example]]
 name = "svg"
 path = "examples/svg/svg.rs"
 
