@@ -1,7 +1,7 @@
 @group(1) @binding(0) var t_instances: texture_2d<u32>;
 
-// Each texel of `t_instances` packs four 32-bit words of instance data. Records
-// are read strictly front to back, so all readers share a cursor that keeps the
+// Each texel of `t_instances` packs four 32-bit words of instance data. Most
+// records are read strictly front to back through a cursor that keeps the
 // most recently fetched texel and only touches the texture again when the next
 // word crosses a texel boundary. This fetches each texel exactly once per
 // record load instead of once per word. The `read_*` functions must therefore
