@@ -148,11 +148,10 @@ impl Tick {
         };
         let mut recorder = recorder.lock().unwrap_or_else(|e| e.into_inner());
         recorder.depth += 1;
+        // The frame was reset when the last tick finished. A present made between ticks, such as
+        // a held frame going out just before this request, stays with it.
         if recorder.depth == 1 {
-            recorder.frame = Frame {
-                native: source == FrameRequestSource::NativeCallback,
-                ..Frame::default()
-            };
+            recorder.frame.native = source == FrameRequestSource::NativeCallback;
         }
         Self(Some(Instant::now()))
     }
