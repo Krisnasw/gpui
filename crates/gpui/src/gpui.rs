@@ -21,6 +21,8 @@ mod debug_overlay;
 mod element;
 mod elements;
 mod executor;
+/// Frame timing written to a file when `GPUI_FRAME_STATS` is set.
+pub mod frame_stats;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;

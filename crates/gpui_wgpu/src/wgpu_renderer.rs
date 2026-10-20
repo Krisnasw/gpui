@@ -1825,6 +1825,7 @@ impl WgpuRenderer {
             self.failed_frame_count = 0;
         }
 
+        let acquire_start = gpui::frame_stats::start();
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
@@ -1846,6 +1847,7 @@ impl WgpuRenderer {
             }
         };
 
+        gpui::frame_stats::record(gpui::frame_stats::Phase::Acquire, acquire_start);
         // The acquired texture is the authority on frame dimensions; the surface
         // configuration is only a request.
         let size = Size {
@@ -1857,6 +1859,7 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+        let encode_start = gpui::frame_stats::start();
         if let Err(error) = core.render_frame(
             scene,
             &frame_view,
@@ -1868,7 +1871,11 @@ impl WgpuRenderer {
             return false;
         }
 
+        gpui::frame_stats::record(gpui::frame_stats::Phase::Encode, encode_start);
+        let present_start = gpui::frame_stats::start();
         core.resources.queue.present(frame);
+        gpui::frame_stats::record(gpui::frame_stats::Phase::QueuePresent, present_start);
+        gpui::frame_stats::mark_presented();
         true
     }
 }
