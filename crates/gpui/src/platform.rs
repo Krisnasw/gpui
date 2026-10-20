@@ -1279,6 +1279,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
     fn schedule_frame(&self) {}
+    /// Whether presenting an unchanged frame keeps the display at its full refresh rate, so the
+    /// window goes on presenting for a moment after high-rate input. A compositor that only
+    /// repaints for new content gains nothing from it.
+    fn presents_to_hold_refresh_rate(&self) -> bool {
+        true
+    }
     /// Whether the renderer keeps GPU memory that only drawing uses, which the window then frees
     /// through [`Self::release_idle_gpu_memory`] once it stops presenting.
     fn can_release_idle_gpu_memory(&self) -> bool {

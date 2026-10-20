@@ -134,6 +134,9 @@ pub struct WaylandWindowState {
     redraw_requested: bool,
     presentation: PresentationState,
     pending_frame_callback: Option<wl_callback::WlCallback>,
+    /// Set from a commit that asked for a frame callback until that callback fires. A frame
+    /// drawn in that interval is held and presented on the callback.
+    awaiting_frame_callback: bool,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -636,11 +639,27 @@ impl WaylandWindowState {
             redraw_requested: false,
             presentation: PresentationState::Unpresented,
             pending_frame_callback: None,
+            awaiting_frame_callback: false,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
             accesskit_adapter: None,
         })
+    }
+
+    /// Presents the frame drawn ahead of this tick, asking for a frame callback with the commit.
+    fn present_held_frame(&mut self) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if !renderer.has_held_frame() {
+            return;
+        }
+        if self.pending_frame_callback.is_none() {
+            self.pending_frame_callback =
+                Some(self.surface.frame(&self.globals.qh, self.surface.id()));
+        }
+        self.awaiting_frame_callback |= renderer.present_held();
     }
 
     pub fn is_transparent(&self) -> bool {
@@ -766,6 +785,8 @@ enum FrameLoop {
     RescheduleRequested,
     PresentationFailed,
     AwaitingCallback,
+    /// Awaiting a frame callback, with a tick pinged to draw the next frame ahead of it.
+    DrawAhead,
     Scheduled,
     RetryScheduled,
     Parked,
@@ -951,6 +972,7 @@ impl WaylandWindowStatePtr {
         self.frame_loop.set(FrameLoop::Ticking);
         let mut state = self.state.borrow_mut();
         state.resize_throttle = false;
+        state.present_held_frame();
         // GPUI may throttle this tick without calling draw, so leave the request
         // latched until a draw actually reaches the renderer.
         let force_render = state.redraw_requested;
@@ -971,6 +993,17 @@ impl WaylandWindowStatePtr {
         self.update_ime_enabled();
         drop(callbacks);
 
+        // A commit in this tick, or before it, guarantees the callback that drives the next one.
+        // Demand left over from a tick that drew nothing waits for it, since an immediate tick
+        // could spin against GPUI's frame-rate throttle.
+        if self.state.borrow().awaiting_frame_callback
+            && matches!(
+                self.frame_loop.get(),
+                FrameLoop::Ticking | FrameLoop::RescheduleRequested
+            )
+        {
+            self.frame_loop.set(FrameLoop::AwaitingCallback);
+        }
         self.complete_frame();
     }
 
@@ -978,7 +1011,10 @@ impl WaylandWindowStatePtr {
         let mut state = self.state.borrow_mut();
 
         let frame_loop = self.frame_loop.get();
-        if frame_loop == FrameLoop::AwaitingCallback {
+        if matches!(
+            frame_loop,
+            FrameLoop::AwaitingCallback | FrameLoop::DrawAhead
+        ) {
             return;
         }
 
@@ -994,6 +1030,7 @@ impl WaylandWindowStatePtr {
                     state.pending_frame_callback = Some(callback);
                 }
                 state.surface.commit();
+                state.awaiting_frame_callback = true;
                 self.frame_loop.set(FrameLoop::AwaitingCallback);
                 return;
             }
@@ -1021,14 +1058,24 @@ impl WaylandWindowStatePtr {
     pub fn frame_callback_fired(&self, signal_at: Option<Instant>) {
         // Another wl_surface commit may have carried this callback while a retry
         // timer owned the render-loop wakeup.
-        self.state.borrow_mut().pending_frame_callback = None;
-        if self.frame_loop.get() == FrameLoop::AwaitingCallback {
+        {
+            let mut state = self.state.borrow_mut();
+            state.pending_frame_callback = None;
+            state.awaiting_frame_callback = false;
+        }
+        if matches!(
+            self.frame_loop.get(),
+            FrameLoop::AwaitingCallback | FrameLoop::DrawAhead
+        ) {
             self.frame(signal_at, FrameRequestSource::NativeCallback);
         }
     }
 
     pub fn scheduled_frame_fired(&self) {
-        if self.frame_loop.get() == FrameLoop::Scheduled {
+        if matches!(
+            self.frame_loop.get(),
+            FrameLoop::Scheduled | FrameLoop::DrawAhead
+        ) {
             self.frame(
                 self.scheduled_frame_at.take(),
                 FrameRequestSource::LocalSchedule,
@@ -1059,6 +1106,21 @@ impl WaylandWindowStatePtr {
             }
             FrameLoop::Ticking => {
                 self.frame_loop.set(FrameLoop::RescheduleRequested);
+            }
+            // The presented frame is on its way, so draw the next one now and hold it for the
+            // callback instead of starting it only once the callback arrives.
+            FrameLoop::AwaitingCallback if render_ahead_enabled() => {
+                let state = self.state.borrow();
+                let draw_ahead = state.awaiting_frame_callback
+                    && state
+                        .renderer
+                        .as_ref()
+                        .is_some_and(|renderer| !renderer.has_held_frame());
+                drop(state);
+                if draw_ahead {
+                    self.frame_loop.set(FrameLoop::DrawAhead);
+                    self.frame_ping.ping();
+                }
             }
             // A wake is already armed: a ping or retry timer is in flight, or a
             // presented buffer guarantees a compositor frame callback.
@@ -2048,11 +2110,19 @@ impl PlatformWindow for WaylandWindow {
 
         // Surface state changed during this GPUI tick is included in this presentation.
         state.redraw_requested = false;
-        if state.pending_frame_callback.is_none() {
-            let callback = state.surface.frame(&state.globals.qh, state.surface.id());
-            state.pending_frame_callback = Some(callback);
-        }
-        if renderer.draw(scene) {
+        let drawn = match state.awaiting_frame_callback && render_ahead_enabled() {
+            true => renderer.draw_held(scene),
+            false => {
+                if state.pending_frame_callback.is_none() {
+                    let callback = state.surface.frame(&state.globals.qh, state.surface.id());
+                    state.pending_frame_callback = Some(callback);
+                }
+                let presented = renderer.draw(scene);
+                state.awaiting_frame_callback |= presented;
+                presented
+            }
+        };
+        if drawn {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
         } else {
@@ -2067,6 +2137,10 @@ impl PlatformWindow for WaylandWindow {
 
     fn schedule_frame(&self) {
         self.0.schedule_frame();
+    }
+
+    fn presents_to_hold_refresh_rate(&self) -> bool {
+        false
     }
 
     fn can_release_idle_gpu_memory(&self) -> bool {
@@ -2442,4 +2516,13 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
     }
 
     bounds
+}
+
+/// Whether a frame drawn while a frame callback is outstanding is held for that callback. Set
+/// `GPUI_RENDER_AHEAD=0` to present every frame as soon as it is drawn.
+fn render_ahead_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("GPUI_RENDER_AHEAD").is_none_or(|value| value != "0")
+    });
+    *ENABLED
 }

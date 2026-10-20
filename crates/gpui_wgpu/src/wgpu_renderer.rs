@@ -145,6 +145,8 @@ struct WgpuPipelines {
     blit: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     masked: wgpu::RenderPipeline,
+    /// Composites a layer blurred across only, running the gaussian down on the way.
+    blurred: wgpu::RenderPipeline,
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
@@ -436,6 +438,9 @@ pub struct WgpuRenderer {
     /// Compositor GPU hint for adapter selection (unused on WASM).
     #[allow(dead_code)]
     compositor_gpu: Option<CompositorGpuHint>,
+    /// A frame that `draw_held` rendered and submitted but has not presented. It is declared
+    /// before `state` so it drops before the surface it came from.
+    held_frame: Option<wgpu::SurfaceTexture>,
     state: RendererState,
     surface_config: wgpu::SurfaceConfiguration,
     atlas: Arc<WgpuAtlas>,
@@ -659,6 +664,7 @@ impl WgpuRenderer {
         Ok(Self {
             context: gpu_context,
             compositor_gpu,
+            held_frame: None,
             state: RendererState::Ready { surface, core },
             surface_config,
             atlas,
@@ -1115,6 +1121,19 @@ impl WgpuRendererCore {
             &layouts.instances,
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(premultiplied_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let blurred = create_pipeline(
+            "blurred",
+            "vs_blur",
+            "fs_mask_gaussian",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(premultiplied_target)],
             1,
             &shader_module,
@@ -1290,6 +1309,7 @@ impl WgpuRendererCore {
             blit,
             composite,
             masked,
+            blurred,
             quads,
             shadows,
             path_rasterization,
@@ -1352,7 +1372,7 @@ impl WgpuRendererCore {
         &self,
         source: &wgpu::TextureView,
         bounds: Bounds<ScaledPixels>,
-        masked: bool,
+        composite: Composite,
         instances: &InstanceBinding,
         pass: &mut wgpu::RenderPass<'_>,
     ) {
@@ -1370,9 +1390,10 @@ impl WgpuRendererCore {
 
         let texture = self.create_texture_bind_group("layer_bind_group", source);
         let resources = self.resources();
-        pass.set_pipeline(match masked {
-            true => &resources.pipelines.masked,
-            false => &resources.pipelines.composite,
+        pass.set_pipeline(match composite {
+            Composite::Plain => &resources.pipelines.composite,
+            Composite::Masked => &resources.pipelines.masked,
+            Composite::Blurred => &resources.pipelines.blurred,
         });
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
@@ -1422,15 +1443,7 @@ impl WgpuRendererCore {
         clip: Option<Bounds<ScaledPixels>>,
         instance_offset: &mut u64,
     ) -> Result<wgpu::TextureView> {
-        let across = self.write_instance_binding(
-            "gaussian_across_bind_group",
-            instance_offset,
-            &[BlurParams {
-                direction: [1., 0.],
-                radius: sigma,
-                pad: 0,
-            }],
-        )?;
+        let scratch = self.gaussian_across(encoder, source, sigma, clip, instance_offset)?;
         let down = self.write_instance_binding(
             "gaussian_down_bind_group",
             instance_offset,
@@ -1440,25 +1453,12 @@ impl WgpuRendererCore {
                 pad: 0,
             }],
         )?;
-        let scratch = self.filter_view(FilterTarget::Scratch);
         let settled = match spare {
             true => source.clone(),
             false => self.filter_view(FilterTarget::Level(0)),
         };
         let gaussian = self.resources().pipelines.gaussian.clone();
-        let within =
-            |margin: f32| clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(margin)), 1));
-        let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
-
-        self.fullscreen_pass(
-            encoder,
-            "gaussian_across",
-            &gaussian,
-            source,
-            &scratch,
-            &across,
-            within(reach),
-        );
+        let within = clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(1.)), 1));
         self.fullscreen_pass(
             encoder,
             "gaussian_down",
@@ -1466,9 +1466,44 @@ impl WgpuRendererCore {
             &scratch,
             &settled,
             &down,
-            within(1.),
+            within,
         );
         Ok(settled)
+    }
+
+    /// Blurs a source across into the scratch target and returns it. The pass covers the clip
+    /// grown by the kernel, since the pass down reads that far above and below it.
+    fn gaussian_across(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::TextureView,
+        sigma: f32,
+        clip: Option<Bounds<ScaledPixels>>,
+        instance_offset: &mut u64,
+    ) -> Result<wgpu::TextureView> {
+        let across = self.write_instance_binding(
+            "gaussian_across_bind_group",
+            instance_offset,
+            &[BlurParams {
+                direction: [1., 0.],
+                radius: sigma,
+                pad: 0,
+            }],
+        )?;
+        let scratch = self.filter_view(FilterTarget::Scratch);
+        let gaussian = self.resources().pipelines.gaussian.clone();
+        let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
+        let within = clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(reach)), 1));
+        self.fullscreen_pass(
+            encoder,
+            "gaussian_across",
+            &gaussian,
+            source,
+            &scratch,
+            &across,
+            within,
+        );
+        Ok(scratch)
     }
 
     /// Blurs a source with a dual Kawase blur and returns the level it settled at.
@@ -1688,6 +1723,7 @@ impl WgpuRenderer {
         }
         self.surface_config.width = clamped_width.max(1);
         self.surface_config.height = clamped_height.max(1);
+        self.discard_held_frame();
 
         let Some(core) = self.core_mut() else {
             return;
@@ -1729,6 +1765,7 @@ impl WgpuRenderer {
         }
         self.surface_config.alpha_mode = new_alpha_mode;
         let format = self.surface_config.format;
+        self.discard_held_frame();
 
         let Some(core) = self.core_mut() else {
             return;
@@ -1781,7 +1818,64 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    /// Renders the scene and presents it at once. Returns false when no frame reached the
+    /// surface, in which case the caller should try again later.
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        self.held_frame = None;
+        let Some(frame) = self.render(scene) else {
+            return false;
+        };
+        self.present(frame);
+        true
+    }
+
+    /// Renders the scene and submits its GPU work but keeps the frame back until
+    /// [`Self::present_held`]. Drawing ahead like this gives a frame the whole interval up to
+    /// its present, rather than whatever the compositor leaves after it asks for one.
+    pub fn draw_held(&mut self, scene: &Scene) -> bool {
+        self.held_frame = None;
+        let Some(frame) = self.render(scene) else {
+            return false;
+        };
+        self.held_frame = Some(frame);
+        true
+    }
+
+    /// Whether a frame from [`Self::draw_held`] is waiting to be presented.
+    pub fn has_held_frame(&self) -> bool {
+        self.held_frame.is_some()
+    }
+
+    /// Presents the frame that [`Self::draw_held`] kept back. Returns false when there was none.
+    pub fn present_held(&mut self) -> bool {
+        let Some(frame) = self.held_frame.take() else {
+            return false;
+        };
+        self.present(frame);
+        true
+    }
+
+    /// Drops a held frame unpresented, because the surface is about to change under it. The
+    /// next [`Self::needs_redraw`] then asks for a new one.
+    fn discard_held_frame(&mut self) {
+        if self.held_frame.take().is_some() {
+            self.needs_redraw = true;
+        }
+    }
+
+    fn present(&mut self, frame: wgpu::SurfaceTexture) {
+        let RendererState::Ready { core, .. } = &self.state else {
+            return;
+        };
+        let present_start = gpui::frame_stats::start();
+        core.resources.queue.present(frame);
+        gpui::frame_stats::record(gpui::frame_stats::Phase::QueuePresent, present_start);
+        gpui::frame_stats::mark_presented();
+    }
+
+    /// Acquires a surface texture, renders the scene into it and submits the work. Returns
+    /// None when the surface could not give a texture or the frame failed.
+    fn render(&mut self, scene: &Scene) -> Option<wgpu::SurfaceTexture> {
         #[cfg(target_family = "wasm")]
         if self.device_lost() {
             if matches!(self.state, RendererState::Ready { .. }) {
@@ -1790,7 +1884,7 @@ impl WgpuRenderer {
                 );
                 self.unconfigure_surface();
             }
-            return false;
+            return None;
         }
 
         // Bail out early if the surface has been unconfigured (e.g. during
@@ -1798,7 +1892,7 @@ impl WgpuRenderer {
         // a texture from an unconfigured surface can block indefinitely on
         // some drivers (Adreno).
         let RendererState::Ready { surface, core } = &mut self.state else {
-            return false;
+            return None;
         };
 
         if let Some(error) = self.last_surface_error.take().or_else(|| {
@@ -1819,33 +1913,35 @@ impl WgpuRenderer {
                 self.atlas.clear();
                 self.needs_redraw = true;
                 self.failed_frame_count = 0;
-                return false;
+                return None;
             }
         } else {
             self.failed_frame_count = 0;
         }
 
+        let acquire_start = gpui::frame_stats::start();
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 // Textures must be destroyed before the surface can be reconfigured.
                 drop(frame);
                 surface.configure(&core.resources.device, &self.surface_config);
-                return false;
+                return None;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 surface.configure(&core.resources.device, &self.surface_config);
-                return false;
+                return None;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return false;
+                return None;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 self.last_surface_error = Some("Surface texture validation error".to_string());
-                return false;
+                return None;
             }
         };
 
+        gpui::frame_stats::record(gpui::frame_stats::Phase::Acquire, acquire_start);
         // The acquired texture is the authority on frame dimensions; the surface
         // configuration is only a request.
         let size = Size {
@@ -1857,6 +1953,7 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let premultiplied_alpha =
             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
+        let encode_start = gpui::frame_stats::start();
         if let Err(error) = core.render_frame(
             scene,
             &frame_view,
@@ -1865,11 +1962,11 @@ impl WgpuRenderer {
             wgpu::Color::TRANSPARENT,
         ) {
             log::error!("{error:#}");
-            return false;
+            return None;
         }
 
-        core.resources.queue.present(frame);
-        true
+        gpui::frame_stats::record(gpui::frame_stats::Phase::Encode, encode_start);
+        Some(frame)
     }
 }
 
@@ -2210,7 +2307,7 @@ impl WgpuRendererCore {
                     let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
 
                     drop(pass);
-                    let (onto, blurred, params) = self.close_layer(
+                    let (onto, blurred, params, composite) = self.close_layer(
                         &mut encoder,
                         layer,
                         clip,
@@ -2228,7 +2325,7 @@ impl WgpuRendererCore {
                     self.composite_layer(
                         &blurred,
                         layer.destination_scissor_bounds(clip),
-                        layer.filter.fades(),
+                        composite,
                         &params,
                         &mut pass,
                     );
@@ -2380,7 +2477,7 @@ impl WgpuRendererCore {
                 let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
 
                 drop(pass);
-                let (onto, blurred, params) = self.close_layer(
+                let (onto, blurred, params, composite) = self.close_layer(
                     &mut encoder,
                     layer,
                     clip,
@@ -2398,7 +2495,7 @@ impl WgpuRendererCore {
                 self.composite_layer(
                     &blurred,
                     layer.destination_scissor_bounds(clip),
-                    layer.filter.fades(),
+                    composite,
                     &params,
                     &mut pass,
                 );
@@ -2446,29 +2543,51 @@ impl WgpuRendererCore {
         depth: usize,
         main_view: &wgpu::TextureView,
         instance_offset: &mut u64,
-    ) -> Result<(wgpu::TextureView, wgpu::TextureView, InstanceBinding)> {
+    ) -> Result<(
+        wgpu::TextureView,
+        wgpu::TextureView,
+        InstanceBinding,
+        Composite,
+    )> {
         let source = self.filter_view(FilterTarget::Layer(depth.min(LAYER_DEPTH - 1)));
         let onto = match depth.checked_sub(1) {
             Some(parent) => self.filter_view(FilterTarget::Layer(parent.min(LAYER_DEPTH - 1))),
             None => main_view.clone(),
         };
-        let blurred = match layer.filter.blurs() {
-            true => self.blur_source(
-                encoder,
-                &source,
-                true,
-                layer.filter.blur,
-                Some(layer.blur_bounds(clip)),
-                instance_offset,
-            )?,
-            false => source,
+        let mut mask = mask_params(layer, clip);
+        // A narrow blur leaves its pass down to the composite, which saves a pass of its own.
+        let folded = match BlurPasses::for_sigma(layer.filter.blur) {
+            BlurPasses::Gaussian(sigma) if layer.filter.blurs() => Some(sigma),
+            _ => None,
         };
-        let params = self.write_instance_binding(
-            "layer_composite_bind_group",
-            instance_offset,
-            &[mask_params(layer, clip)],
-        )?;
-        Ok((onto, blurred, params))
+        let (blurred, composite) = match (folded, layer.filter.blurs()) {
+            (Some(sigma), _) => {
+                mask.pad = sigma;
+                let across = self.gaussian_across(
+                    encoder,
+                    &source,
+                    sigma,
+                    Some(layer.blur_bounds(clip)),
+                    instance_offset,
+                )?;
+                (across, Composite::Blurred)
+            }
+            (None, true) => (
+                self.blur_source(
+                    encoder,
+                    &source,
+                    true,
+                    layer.filter.blur,
+                    Some(layer.blur_bounds(clip)),
+                    instance_offset,
+                )?,
+                Composite::of(layer),
+            ),
+            (None, false) => (source, Composite::of(layer)),
+        };
+        let params =
+            self.write_instance_binding("layer_composite_bind_group", instance_offset, &[mask])?;
+        Ok((onto, blurred, params, composite))
     }
 
     fn write_instances(
@@ -3003,6 +3122,7 @@ impl WgpuRenderer {
     /// (e.g. Android `TerminateWindow`) but you intend to re-create the
     /// surface later without losing cached atlas textures.
     pub fn unconfigure_surface(&mut self) {
+        self.discard_held_frame();
         self.state = match std::mem::replace(&mut self.state, RendererState::Released) {
             RendererState::Ready { core, surface } => {
                 drop(surface);
@@ -3036,6 +3156,7 @@ impl WgpuRenderer {
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
 
         let surface = create_surface(instance, window_handle.as_raw())?;
+        self.discard_held_frame();
 
         let width = (config.size.width.0 as u32).max(1);
         let height = (config.size.height.0 as u32).max(1);
@@ -3090,6 +3211,7 @@ impl WgpuRenderer {
     }
 
     pub fn destroy(&mut self) {
+        self.held_frame = None;
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
         self.state = RendererState::Released;
@@ -3118,6 +3240,7 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
+        self.held_frame = None;
         let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
 
         // Check if another window already recovered the context
@@ -3448,6 +3571,25 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.core.atlas.clone()
+    }
+}
+
+/// Which pipeline draws a closed layer back into what it was opened over.
+#[derive(Clone, Copy)]
+enum Composite {
+    Plain,
+    /// The layer fades towards its edges.
+    Masked,
+    /// The layer has been blurred across only, and the composite blurs it down.
+    Blurred,
+}
+
+impl Composite {
+    fn of(layer: LayerEffect) -> Self {
+        match layer.filter.fades() {
+            true => Self::Masked,
+            false => Self::Plain,
+        }
     }
 }
 

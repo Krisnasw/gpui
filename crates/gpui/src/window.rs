@@ -1787,6 +1787,7 @@ impl Window {
                 });
             }
         }));
+        let presents_to_hold_refresh_rate = platform_window.presents_to_hold_refresh_rate();
         platform_window.on_request_frame(Box::new({
             let mut cx = cx.to_async();
             let invalidator = invalidator.clone();
@@ -1796,6 +1797,8 @@ impl Window {
             let input_rate_tracker = input_rate_tracker.clone();
             let mut deferred_force_render = false;
             move |request_frame_options| {
+                let _frame_stats_tick =
+                    crate::frame_stats::Tick::begin(request_frame_options.signal_source);
                 #[cfg(feature = "profiler")]
                 let (_foreground_turn, window_id) = {
                     let foreground_turn = profiler::journal::foreground_turn();
@@ -1895,6 +1898,7 @@ impl Window {
 
                 let pending_next_frame_callbacks = next_frame_callbacks.take();
                 if !pending_next_frame_callbacks.is_empty() {
+                    let callbacks_start = crate::frame_stats::start();
                     handle
                         .update(&mut cx, |_, window, cx| {
                             for callback in pending_next_frame_callbacks {
@@ -1902,14 +1906,20 @@ impl Window {
                             }
                         })
                         .log_err();
+                    crate::frame_stats::record(
+                        crate::frame_stats::Phase::Callbacks,
+                        callbacks_start,
+                    );
                 }
 
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
-                // to prevent display underclocking during active input.
+                // to prevent display underclocking during active input, on platforms where
+                // presenting an unchanged frame does that.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || input_rate_tracker.borrow_mut().is_high_rate();
+                    || (presents_to_hold_refresh_rate
+                        && input_rate_tracker.borrow_mut().is_high_rate());
 
                 let should_draw = invalidator.is_dirty() || force_render;
                 if should_draw {
@@ -1925,7 +1935,13 @@ impl Window {
                                     // atlas tile references after a GPU device recovery.
                                     window.refresh();
                                 }
+                                let draw_start = crate::frame_stats::start();
                                 let arena_clear_needed = window.draw(cx);
+                                crate::frame_stats::record(
+                                    crate::frame_stats::Phase::Draw,
+                                    draw_start,
+                                );
+                                crate::frame_stats::mark_drawn();
                                 window.present();
                                 window.arm_idle_gpu_release(cx);
                                 arena_clear_needed.clear(cx);
@@ -3673,7 +3689,9 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        let frame_stats_present = crate::frame_stats::start();
         self.platform_window.draw(&self.rendered_frame.scene);
+        crate::frame_stats::record(crate::frame_stats::Phase::Present, frame_stats_present);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3860,8 +3878,11 @@ impl Window {
         let scale_factor = self.scale_factor();
         #[cfg(feature = "profiler")]
         let request_layout_start = Instant::now();
+        let frame_stats_render = crate::frame_stats::start();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
+        crate::frame_stats::record(crate::frame_stats::Phase::Render, frame_stats_render);
+        let frame_stats_prepaint = crate::frame_stats::start();
         #[cfg(feature = "profiler")]
         let prepaint_start = Instant::now();
         self.layout_engine
@@ -3907,6 +3928,8 @@ impl Window {
         let prepainted = std::time::Instant::now();
         #[cfg(feature = "profiler")]
         let paint_start = Instant::now();
+        crate::frame_stats::record(crate::frame_stats::Phase::Prepaint, frame_stats_prepaint);
+        let frame_stats_paint = crate::frame_stats::start();
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -3922,6 +3945,7 @@ impl Window {
         } else if let Some(mut tooltip_element) = tooltip_element {
             tooltip_element.paint(self, cx);
         }
+        crate::frame_stats::record(crate::frame_stats::Phase::Paint, frame_stats_paint);
 
         #[cfg(feature = "profiler")]
         {
@@ -5574,8 +5598,10 @@ impl Window {
     ) {
         self.invalidator.debug_assert_prepaint();
 
+        let frame_stats_layout = crate::frame_stats::start();
         let mut layout_engine = self.layout_engine.take().unwrap();
         layout_engine.compute_layout(layout_id, available_space, self, cx);
+        crate::frame_stats::record(crate::frame_stats::Phase::Layout, frame_stats_layout);
         self.layout_engine = Some(layout_engine);
     }
 
