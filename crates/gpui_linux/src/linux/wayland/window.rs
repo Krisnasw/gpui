@@ -2069,6 +2069,10 @@ impl PlatformWindow for WaylandWindow {
         self.0.schedule_frame();
     }
 
+    fn presents_to_hold_refresh_rate(&self) -> bool {
+        false
+    }
+
     fn can_release_idle_gpu_memory(&self) -> bool {
         true
     }

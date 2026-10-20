@@ -1787,6 +1787,7 @@ impl Window {
                 });
             }
         }));
+        let presents_to_hold_refresh_rate = platform_window.presents_to_hold_refresh_rate();
         platform_window.on_request_frame(Box::new({
             let mut cx = cx.to_async();
             let invalidator = invalidator.clone();
@@ -1913,10 +1914,12 @@ impl Window {
 
                 // Keep presenting if input was recently arriving at a high rate (>= 60fps).
                 // Once high-rate input is detected, we sustain presentation for 1 second
-                // to prevent display underclocking during active input.
+                // to prevent display underclocking during active input, on platforms where
+                // presenting an unchanged frame does that.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || input_rate_tracker.borrow_mut().is_high_rate();
+                    || (presents_to_hold_refresh_rate
+                        && input_rate_tracker.borrow_mut().is_high_rate());
 
                 let should_draw = invalidator.is_dirty() || force_render;
                 if should_draw {
