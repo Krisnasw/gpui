@@ -1506,12 +1506,17 @@ fn vs_blur(@builtin(vertex_index) vertex_id: u32) -> BlurVarying {
 @fragment
 fn fs_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
     let blur = load_blur(0u);
-    let texel = blur.direction / vec2<f32>(textureDimensions(t_sprite));
-    let sigma = max(blur.radius, 0.0001);
+    return gaussian_pass(input.uv, blur.direction, blur.radius);
+}
+
+// One gaussian pass along `direction` at `uv`, with `radius` as its standard deviation.
+fn gaussian_pass(uv: vec2<f32>, direction: vec2<f32>, radius: f32) -> vec4<f32> {
+    let texel = direction / vec2<f32>(textureDimensions(t_sprite));
+    let sigma = max(radius, 0.0001);
     let reach = min(ceil(sigma * 3.0), 24.0);
     let spread = 2.0 * sigma * sigma;
 
-    var total = textureSample(t_sprite, s_sprite, input.uv);
+    var total = textureSample(t_sprite, s_sprite, uv);
     var weight = 1.0;
     var inner = 1.0;
     while (inner <= reach) {
@@ -1520,8 +1525,8 @@ fn fs_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
         let outer_weight = select(0.0, exp(-outer * outer / spread), outer <= reach);
         let pair = inner_weight + outer_weight;
         let at = texel * ((inner * inner_weight + outer * outer_weight) / pair);
-        total += pair * textureSample(t_sprite, s_sprite, input.uv + at);
-        total += pair * textureSample(t_sprite, s_sprite, input.uv - at);
+        total += pair * textureSample(t_sprite, s_sprite, uv + at);
+        total += pair * textureSample(t_sprite, s_sprite, uv - at);
         weight += pair * 2.0;
         inner += 2.0;
     }
@@ -1583,15 +1588,60 @@ struct Mask {
 @fragment
 fn fs_mask(input: BlurVarying) -> @location(0) vec4<f32> {
     let mask = load_mask(0u);
-    let destination_point = input.position.xy;
-    let source_point = mask.transform_origin
+    let source_point = mask_source(mask, input.position.xy);
+    let coverage = mask_coverage(mask, source_point);
+    if (coverage <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    return textureSample(t_sprite, s_sprite, source_point / globals.viewport_size) * coverage;
+}
+
+// `fs_mask` for a layer the gaussian has only blurred across, which runs the pass down on the
+// way into the frame with `pad` as its standard deviation. It takes one tap per texel rather
+// than pairing them, so a source point between texel centres, as a transformed layer has, gets
+// the bilinear sample of what the pass down would have stored.
+@fragment
+fn fs_mask_gaussian(input: BlurVarying) -> @location(0) vec4<f32> {
+    let mask = load_mask(0u);
+    let source_point = mask_source(mask, input.position.xy);
+    let coverage = mask_coverage(mask, source_point);
+    if (coverage <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    let uv = source_point / globals.viewport_size;
+    let texel = vec2<f32>(0.0, 1.0) / vec2<f32>(textureDimensions(t_sprite));
+    let sigma = max(mask.pad, 0.0001);
+    let reach = min(ceil(sigma * 3.0), 24.0);
+    let spread = 2.0 * sigma * sigma;
+
+    var total = textureSample(t_sprite, s_sprite, uv);
+    var weight = 1.0;
+    var tap = 1.0;
+    while (tap <= reach) {
+        let tap_weight = exp(-tap * tap / spread);
+        total += tap_weight * textureSample(t_sprite, s_sprite, uv + texel * tap);
+        total += tap_weight * textureSample(t_sprite, s_sprite, uv - texel * tap);
+        weight += tap_weight * 2.0;
+        tap += 1.0;
+    }
+    return total / weight * coverage;
+}
+
+// Where a destination pixel of a layer reads its source, undoing the layer's transform.
+fn mask_source(mask: Mask, destination_point: vec2<f32>) -> vec2<f32> {
+    return mask.transform_origin
         + (destination_point - mask.translation - mask.transform_origin) / mask.scale;
+}
+
+// How much of a layer's source point reaches the frame: nothing outside the source, and the
+// edge fades within it.
+fn mask_coverage(mask: Mask, source_point: vec2<f32>) -> f32 {
     let source_end = mask.source_bounds.origin + mask.source_bounds.size;
     if (any(source_point < mask.source_bounds.origin)
         || any(source_point >= source_end)
         || any(source_point < vec2<f32>(0.0))
         || any(source_point >= globals.viewport_size)) {
-        return vec4<f32>(0.0);
+        return 0.0;
     }
 
     let top = source_point.y - mask.fade_bounds.origin.y;
@@ -1613,6 +1663,5 @@ fn fs_mask(input: BlurVarying) -> @location(0) vec4<f32> {
         coverage = min(coverage, smoothstep(0.0, mask.fade_right, right));
     }
 
-    let sampled = textureSample(t_sprite, s_sprite, source_point / globals.viewport_size);
-    return sampled * coverage;
+    return coverage;
 }

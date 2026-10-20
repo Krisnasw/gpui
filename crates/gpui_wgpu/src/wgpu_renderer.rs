@@ -145,6 +145,8 @@ struct WgpuPipelines {
     blit: wgpu::RenderPipeline,
     composite: wgpu::RenderPipeline,
     masked: wgpu::RenderPipeline,
+    /// Composites a layer blurred across only, running the gaussian down on the way.
+    blurred: wgpu::RenderPipeline,
     quads: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
@@ -1119,6 +1121,19 @@ impl WgpuRendererCore {
             &layouts.instances,
             Some(&layouts.texture),
             wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(premultiplied_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        let blurred = create_pipeline(
+            "blurred",
+            "vs_blur",
+            "fs_mask_gaussian",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(premultiplied_target)],
             1,
             &shader_module,
@@ -1294,6 +1309,7 @@ impl WgpuRendererCore {
             blit,
             composite,
             masked,
+            blurred,
             quads,
             shadows,
             path_rasterization,
@@ -1356,7 +1372,7 @@ impl WgpuRendererCore {
         &self,
         source: &wgpu::TextureView,
         bounds: Bounds<ScaledPixels>,
-        masked: bool,
+        composite: Composite,
         instances: &InstanceBinding,
         pass: &mut wgpu::RenderPass<'_>,
     ) {
@@ -1374,9 +1390,10 @@ impl WgpuRendererCore {
 
         let texture = self.create_texture_bind_group("layer_bind_group", source);
         let resources = self.resources();
-        pass.set_pipeline(match masked {
-            true => &resources.pipelines.masked,
-            false => &resources.pipelines.composite,
+        pass.set_pipeline(match composite {
+            Composite::Plain => &resources.pipelines.composite,
+            Composite::Masked => &resources.pipelines.masked,
+            Composite::Blurred => &resources.pipelines.blurred,
         });
         pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
@@ -1426,15 +1443,7 @@ impl WgpuRendererCore {
         clip: Option<Bounds<ScaledPixels>>,
         instance_offset: &mut u64,
     ) -> Result<wgpu::TextureView> {
-        let across = self.write_instance_binding(
-            "gaussian_across_bind_group",
-            instance_offset,
-            &[BlurParams {
-                direction: [1., 0.],
-                radius: sigma,
-                pad: 0,
-            }],
-        )?;
+        let scratch = self.gaussian_across(encoder, source, sigma, clip, instance_offset)?;
         let down = self.write_instance_binding(
             "gaussian_down_bind_group",
             instance_offset,
@@ -1444,25 +1453,12 @@ impl WgpuRendererCore {
                 pad: 0,
             }],
         )?;
-        let scratch = self.filter_view(FilterTarget::Scratch);
         let settled = match spare {
             true => source.clone(),
             false => self.filter_view(FilterTarget::Level(0)),
         };
         let gaussian = self.resources().pipelines.gaussian.clone();
-        let within =
-            |margin: f32| clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(margin)), 1));
-        let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
-
-        self.fullscreen_pass(
-            encoder,
-            "gaussian_across",
-            &gaussian,
-            source,
-            &scratch,
-            &across,
-            within(reach),
-        );
+        let within = clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(1.)), 1));
         self.fullscreen_pass(
             encoder,
             "gaussian_down",
@@ -1470,9 +1466,44 @@ impl WgpuRendererCore {
             &scratch,
             &settled,
             &down,
-            within(1.),
+            within,
         );
         Ok(settled)
+    }
+
+    /// Blurs a source across into the scratch target and returns it. The pass covers the clip
+    /// grown by the kernel, since the pass down reads that far above and below it.
+    fn gaussian_across(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::TextureView,
+        sigma: f32,
+        clip: Option<Bounds<ScaledPixels>>,
+        instance_offset: &mut u64,
+    ) -> Result<wgpu::TextureView> {
+        let across = self.write_instance_binding(
+            "gaussian_across_bind_group",
+            instance_offset,
+            &[BlurParams {
+                direction: [1., 0.],
+                radius: sigma,
+                pad: 0,
+            }],
+        )?;
+        let scratch = self.filter_view(FilterTarget::Scratch);
+        let gaussian = self.resources().pipelines.gaussian.clone();
+        let reach = (sigma * GAUSSIAN_REACH).ceil() + 1.;
+        let within = clip.map(|clip| self.scissor(clip.dilate(ScaledPixels(reach)), 1));
+        self.fullscreen_pass(
+            encoder,
+            "gaussian_across",
+            &gaussian,
+            source,
+            &scratch,
+            &across,
+            within,
+        );
+        Ok(scratch)
     }
 
     /// Blurs a source with a dual Kawase blur and returns the level it settled at.
@@ -2276,7 +2307,7 @@ impl WgpuRendererCore {
                     let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
 
                     drop(pass);
-                    let (onto, blurred, params) = self.close_layer(
+                    let (onto, blurred, params, composite) = self.close_layer(
                         &mut encoder,
                         layer,
                         clip,
@@ -2294,7 +2325,7 @@ impl WgpuRendererCore {
                     self.composite_layer(
                         &blurred,
                         layer.destination_scissor_bounds(clip),
-                        layer.filter.fades(),
+                        composite,
                         &params,
                         &mut pass,
                     );
@@ -2446,7 +2477,7 @@ impl WgpuRendererCore {
                 let clip = spans.pop().unwrap_or_else(|| layer.destination_clip());
 
                 drop(pass);
-                let (onto, blurred, params) = self.close_layer(
+                let (onto, blurred, params, composite) = self.close_layer(
                     &mut encoder,
                     layer,
                     clip,
@@ -2464,7 +2495,7 @@ impl WgpuRendererCore {
                 self.composite_layer(
                     &blurred,
                     layer.destination_scissor_bounds(clip),
-                    layer.filter.fades(),
+                    composite,
                     &params,
                     &mut pass,
                 );
@@ -2512,29 +2543,51 @@ impl WgpuRendererCore {
         depth: usize,
         main_view: &wgpu::TextureView,
         instance_offset: &mut u64,
-    ) -> Result<(wgpu::TextureView, wgpu::TextureView, InstanceBinding)> {
+    ) -> Result<(
+        wgpu::TextureView,
+        wgpu::TextureView,
+        InstanceBinding,
+        Composite,
+    )> {
         let source = self.filter_view(FilterTarget::Layer(depth.min(LAYER_DEPTH - 1)));
         let onto = match depth.checked_sub(1) {
             Some(parent) => self.filter_view(FilterTarget::Layer(parent.min(LAYER_DEPTH - 1))),
             None => main_view.clone(),
         };
-        let blurred = match layer.filter.blurs() {
-            true => self.blur_source(
-                encoder,
-                &source,
-                true,
-                layer.filter.blur,
-                Some(layer.blur_bounds(clip)),
-                instance_offset,
-            )?,
-            false => source,
+        let mut mask = mask_params(layer, clip);
+        // A narrow blur leaves its pass down to the composite, which saves a pass of its own.
+        let folded = match BlurPasses::for_sigma(layer.filter.blur) {
+            BlurPasses::Gaussian(sigma) if layer.filter.blurs() => Some(sigma),
+            _ => None,
         };
-        let params = self.write_instance_binding(
-            "layer_composite_bind_group",
-            instance_offset,
-            &[mask_params(layer, clip)],
-        )?;
-        Ok((onto, blurred, params))
+        let (blurred, composite) = match (folded, layer.filter.blurs()) {
+            (Some(sigma), _) => {
+                mask.pad = sigma;
+                let across = self.gaussian_across(
+                    encoder,
+                    &source,
+                    sigma,
+                    Some(layer.blur_bounds(clip)),
+                    instance_offset,
+                )?;
+                (across, Composite::Blurred)
+            }
+            (None, true) => (
+                self.blur_source(
+                    encoder,
+                    &source,
+                    true,
+                    layer.filter.blur,
+                    Some(layer.blur_bounds(clip)),
+                    instance_offset,
+                )?,
+                Composite::of(layer),
+            ),
+            (None, false) => (source, Composite::of(layer)),
+        };
+        let params =
+            self.write_instance_binding("layer_composite_bind_group", instance_offset, &[mask])?;
+        Ok((onto, blurred, params, composite))
     }
 
     fn write_instances(
@@ -3518,6 +3571,25 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.core.atlas.clone()
+    }
+}
+
+/// Which pipeline draws a closed layer back into what it was opened over.
+#[derive(Clone, Copy)]
+enum Composite {
+    Plain,
+    /// The layer fades towards its edges.
+    Masked,
+    /// The layer has been blurred across only, and the composite blurs it down.
+    Blurred,
+}
+
+impl Composite {
+    fn of(layer: LayerEffect) -> Self {
+        match layer.filter.fades() {
+            true => Self::Masked,
+            false => Self::Plain,
+        }
     }
 }
 
