@@ -436,6 +436,9 @@ pub struct WgpuRenderer {
     /// Compositor GPU hint for adapter selection (unused on WASM).
     #[allow(dead_code)]
     compositor_gpu: Option<CompositorGpuHint>,
+    /// A frame that `draw_held` rendered and submitted but has not presented. It is declared
+    /// before `state` so it drops before the surface it came from.
+    held_frame: Option<wgpu::SurfaceTexture>,
     state: RendererState,
     surface_config: wgpu::SurfaceConfiguration,
     atlas: Arc<WgpuAtlas>,
@@ -659,6 +662,7 @@ impl WgpuRenderer {
         Ok(Self {
             context: gpu_context,
             compositor_gpu,
+            held_frame: None,
             state: RendererState::Ready { surface, core },
             surface_config,
             atlas,
@@ -1688,6 +1692,7 @@ impl WgpuRenderer {
         }
         self.surface_config.width = clamped_width.max(1);
         self.surface_config.height = clamped_height.max(1);
+        self.discard_held_frame();
 
         let Some(core) = self.core_mut() else {
             return;
@@ -1729,6 +1734,7 @@ impl WgpuRenderer {
         }
         self.surface_config.alpha_mode = new_alpha_mode;
         let format = self.surface_config.format;
+        self.discard_held_frame();
 
         let Some(core) = self.core_mut() else {
             return;
@@ -1781,7 +1787,64 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    /// Renders the scene and presents it at once. Returns false when no frame reached the
+    /// surface, in which case the caller should try again later.
     pub fn draw(&mut self, scene: &Scene) -> bool {
+        self.held_frame = None;
+        let Some(frame) = self.render(scene) else {
+            return false;
+        };
+        self.present(frame);
+        true
+    }
+
+    /// Renders the scene and submits its GPU work but keeps the frame back until
+    /// [`Self::present_held`]. Drawing ahead like this gives a frame the whole interval up to
+    /// its present, rather than whatever the compositor leaves after it asks for one.
+    pub fn draw_held(&mut self, scene: &Scene) -> bool {
+        self.held_frame = None;
+        let Some(frame) = self.render(scene) else {
+            return false;
+        };
+        self.held_frame = Some(frame);
+        true
+    }
+
+    /// Whether a frame from [`Self::draw_held`] is waiting to be presented.
+    pub fn has_held_frame(&self) -> bool {
+        self.held_frame.is_some()
+    }
+
+    /// Presents the frame that [`Self::draw_held`] kept back. Returns false when there was none.
+    pub fn present_held(&mut self) -> bool {
+        let Some(frame) = self.held_frame.take() else {
+            return false;
+        };
+        self.present(frame);
+        true
+    }
+
+    /// Drops a held frame unpresented, because the surface is about to change under it. The
+    /// next [`Self::needs_redraw`] then asks for a new one.
+    fn discard_held_frame(&mut self) {
+        if self.held_frame.take().is_some() {
+            self.needs_redraw = true;
+        }
+    }
+
+    fn present(&mut self, frame: wgpu::SurfaceTexture) {
+        let RendererState::Ready { core, .. } = &self.state else {
+            return;
+        };
+        let present_start = gpui::frame_stats::start();
+        core.resources.queue.present(frame);
+        gpui::frame_stats::record(gpui::frame_stats::Phase::QueuePresent, present_start);
+        gpui::frame_stats::mark_presented();
+    }
+
+    /// Acquires a surface texture, renders the scene into it and submits the work. Returns
+    /// None when the surface could not give a texture or the frame failed.
+    fn render(&mut self, scene: &Scene) -> Option<wgpu::SurfaceTexture> {
         #[cfg(target_family = "wasm")]
         if self.device_lost() {
             if matches!(self.state, RendererState::Ready { .. }) {
@@ -1790,7 +1853,7 @@ impl WgpuRenderer {
                 );
                 self.unconfigure_surface();
             }
-            return false;
+            return None;
         }
 
         // Bail out early if the surface has been unconfigured (e.g. during
@@ -1798,7 +1861,7 @@ impl WgpuRenderer {
         // a texture from an unconfigured surface can block indefinitely on
         // some drivers (Adreno).
         let RendererState::Ready { surface, core } = &mut self.state else {
-            return false;
+            return None;
         };
 
         if let Some(error) = self.last_surface_error.take().or_else(|| {
@@ -1819,7 +1882,7 @@ impl WgpuRenderer {
                 self.atlas.clear();
                 self.needs_redraw = true;
                 self.failed_frame_count = 0;
-                return false;
+                return None;
             }
         } else {
             self.failed_frame_count = 0;
@@ -1832,18 +1895,18 @@ impl WgpuRenderer {
                 // Textures must be destroyed before the surface can be reconfigured.
                 drop(frame);
                 surface.configure(&core.resources.device, &self.surface_config);
-                return false;
+                return None;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 surface.configure(&core.resources.device, &self.surface_config);
-                return false;
+                return None;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return false;
+                return None;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 self.last_surface_error = Some("Surface texture validation error".to_string());
-                return false;
+                return None;
             }
         };
 
@@ -1868,15 +1931,11 @@ impl WgpuRenderer {
             wgpu::Color::TRANSPARENT,
         ) {
             log::error!("{error:#}");
-            return false;
+            return None;
         }
 
         gpui::frame_stats::record(gpui::frame_stats::Phase::Encode, encode_start);
-        let present_start = gpui::frame_stats::start();
-        core.resources.queue.present(frame);
-        gpui::frame_stats::record(gpui::frame_stats::Phase::QueuePresent, present_start);
-        gpui::frame_stats::mark_presented();
-        true
+        Some(frame)
     }
 }
 
@@ -3010,6 +3069,7 @@ impl WgpuRenderer {
     /// (e.g. Android `TerminateWindow`) but you intend to re-create the
     /// surface later without losing cached atlas textures.
     pub fn unconfigure_surface(&mut self) {
+        self.discard_held_frame();
         self.state = match std::mem::replace(&mut self.state, RendererState::Released) {
             RendererState::Ready { core, surface } => {
                 drop(surface);
@@ -3043,6 +3103,7 @@ impl WgpuRenderer {
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
 
         let surface = create_surface(instance, window_handle.as_raw())?;
+        self.discard_held_frame();
 
         let width = (config.size.width.0 as u32).max(1);
         let height = (config.size.height.0 as u32).max(1);
@@ -3097,6 +3158,7 @@ impl WgpuRenderer {
     }
 
     pub fn destroy(&mut self) {
+        self.held_frame = None;
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
         self.state = RendererState::Released;
@@ -3125,6 +3187,7 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
+        self.held_frame = None;
         let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
 
         // Check if another window already recovered the context
