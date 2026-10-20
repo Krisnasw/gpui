@@ -653,6 +653,10 @@ impl TextLayout {
         };
         window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
+            // The layout measured before the current one. Flex layout probes a text with and
+            // without a width limit in turn, so keeping both answers each probe without
+            // shaping again.
+            let spare: RefCell<Option<TextLayoutInner>> = RefCell::new(None);
 
             move |known_dimensions, available_space, window, cx| {
                 let wrap_width = if text_style.white_space == WhiteSpace::Normal {
@@ -683,36 +687,51 @@ impl TextLayout {
                         (None, "".into(), TruncateFrom::End)
                     };
 
-                // Only use cached layout if:
-                // 1. We have a cached size
-                // 2. wrap_width matches (or both are None)
-                // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
-                //    because the previous layout may have been computed without truncation)
-                // 4. the cached layout was not truncated (a truncated layout answers an
-                //    unconstrained probe with the truncated size, which poisons intrinsic
-                //    sizing with whatever width some earlier measure pass happened to use)
+                // An untruncated probe reuses an untruncated layout whose wrap width matches, or
+                // any one when it does not wrap. A truncated layout never answers it, since that
+                // would poison intrinsic sizing with whatever width an earlier pass used. A
+                // truncating probe reuses only a layout with the same truncation and wrap
+                // widths, which are the only inputs that differ between calls.
+                let answers = |text_layout: &TextLayoutInner| match truncate_width {
+                    None => {
+                        (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
+                            && text_layout.truncate_width.is_none()
+                    }
+                    Some(_) => {
+                        truncate_width == text_layout.truncate_width
+                            && wrap_width == text_layout.wrap_width
+                    }
+                };
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
                     && let Some(size) = text_layout.size
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
-                    && truncate_width.is_none()
-                    && text_layout.truncate_width.is_none()
+                    && answers(text_layout)
                 {
                     return size;
                 }
+                let mut spare = spare.borrow_mut();
+                if let Some(text_layout) = spare.as_ref()
+                    && let Some(size) = text_layout.size
+                    && answers(text_layout)
+                {
+                    let current = element_state.0.borrow_mut().replace(spare.take().unwrap());
+                    *spare = current;
+                    return size;
+                }
 
-                let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
                 let (text, runs) = if let Some(truncate_width) = truncate_width {
                     if let Some(max_lines) = text_style.line_clamp
                         && let Some(wrap_width) = wrap_width
                     {
-                        line_wrapper.truncate_wrapped_line(
-                            text.clone(),
-                            wrap_width,
-                            max_lines,
-                            &truncation_affix,
-                            &runs,
-                            truncate_from,
-                        )
+                        cx.text_system()
+                            .line_wrapper(text_style.font(), font_size)
+                            .truncate_wrapped_line(
+                                text.clone(),
+                                wrap_width,
+                                max_lines,
+                                &truncation_affix,
+                                &runs,
+                                truncate_from,
+                            )
                     } else if let Some(unclipped) = window
                         .text_system()
                         .shape_text(text.clone(), font_size, &runs, None, None)
@@ -729,13 +748,15 @@ impl TextLayout {
                         // already measured untruncated this frame.
                         (text.clone(), Cow::Borrowed(&*runs))
                     } else {
-                        line_wrapper.truncate_line(
-                            text.clone(),
-                            truncate_width,
-                            &truncation_affix,
-                            &runs,
-                            truncate_from,
-                        )
+                        cx.text_system()
+                            .line_wrapper(text_style.font(), font_size)
+                            .truncate_line(
+                                text.clone(),
+                                truncate_width,
+                                &truncation_affix,
+                                &runs,
+                                truncate_from,
+                            )
                     }
                 } else {
                     (text.clone(), Cow::Borrowed(&*runs))
@@ -753,7 +774,7 @@ impl TextLayout {
                     )
                     .log_err()
                 else {
-                    element_state.0.borrow_mut().replace(TextLayoutInner {
+                    *spare = element_state.0.borrow_mut().replace(TextLayoutInner {
                         lines: Default::default(),
                         len: 0,
                         line_height,
@@ -772,7 +793,7 @@ impl TextLayout {
                     size.width = size.width.max(line_size.width).ceil();
                 }
 
-                element_state.0.borrow_mut().replace(TextLayoutInner {
+                *spare = element_state.0.borrow_mut().replace(TextLayoutInner {
                     lines,
                     len,
                     line_height,
