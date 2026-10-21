@@ -325,6 +325,7 @@ impl<'a> ShapedLineCursor<'a> {
                             is_emoji: glyph.is_emoji,
                         })
                         .collect(),
+                    font_size: run.font_size,
                 });
             }
             if let Some(glyph) = run.glyphs.get(self.glyph_index) {
@@ -775,14 +776,14 @@ fn paint_line(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            run.font_size.unwrap_or(layout.font_size),
                         )?;
                     } else {
                         window.paint_glyph(
                             glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
-                            layout.font_size,
+                            run.font_size.unwrap_or(layout.font_size),
                             color,
                         )?;
                     }
@@ -1081,6 +1082,7 @@ mod tests {
                 runs: vec![ShapedRun {
                     font_id: FontId(0),
                     glyphs: shaped_glyphs,
+                    font_size: None,
                 }],
                 len: text.len(),
             }),
@@ -1548,6 +1550,7 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                        font_size: None,
                     },
                     ShapedRun {
                         font_id: FontId(1),
@@ -1571,6 +1574,7 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                        font_size: None,
                     },
                 ],
                 len: 6,
@@ -1794,6 +1798,7 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                        font_size: None,
                     },
                     ShapedRun {
                         font_id: FontId(8),
@@ -1811,6 +1816,7 @@ mod tests {
                                 is_emoji: false,
                             },
                         ],
+                        font_size: None,
                     },
                 ],
                 len: 10,
