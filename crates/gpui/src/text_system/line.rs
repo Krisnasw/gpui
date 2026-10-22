@@ -150,6 +150,7 @@ impl ShapedLine {
             align_width,
             &self.decoration_runs,
             &[],
+            &[],
             None,
             window,
             cx,
@@ -174,6 +175,7 @@ impl ShapedLine {
             align,
             align_width,
             &self.decoration_runs,
+            &[],
             &[],
             window,
             cx,
@@ -405,6 +407,7 @@ impl LineLayout {
             align_width,
             decoration_runs,
             &[],
+            &[],
             None,
             window,
             cx,
@@ -434,6 +437,7 @@ impl LineLayout {
             align,
             align_width,
             decoration_runs,
+            &[],
             &[],
             window,
             cx,
@@ -510,6 +514,7 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            &self.gaps,
             tint,
             window,
             cx,
@@ -542,12 +547,20 @@ impl WrappedLine {
             align_width,
             &self.decoration_runs,
             &self.wrap_boundaries,
+            &self.gaps,
             window,
             cx,
         )?;
 
         Ok(())
     }
+}
+
+/// The space opened before `index`, which a row that wraps there keeps at its start.
+pub(crate) fn gap_at(gaps: &[(usize, Pixels)], index: usize) -> Pixels {
+    gaps.iter()
+        .find(|(at, _)| *at == index)
+        .map_or(Pixels::ZERO, |(_, width)| *width)
 }
 
 fn paint_line(
@@ -558,6 +571,7 @@ fn paint_line(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    gaps: &[(usize, Pixels)],
     tint: Option<Hsla>,
     window: &mut Window,
     cx: &mut App,
@@ -652,14 +666,15 @@ fn paint_line(
                         }
                     }
 
+                    let gap = gap_at(gaps, glyph.index);
                     glyph_origin.x = aligned_origin_x(
                         origin,
                         align_width.unwrap_or(layout.width),
-                        glyph.position.x,
+                        glyph.position.x - gap,
                         &align,
                         layout,
                         wraps.peek(),
-                    );
+                    ) + gap;
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;
@@ -836,6 +851,7 @@ fn paint_line_background(
     align_width: Option<Pixels>,
     decoration_runs: &[DecorationRun],
     wrap_boundaries: &[WrapBoundary],
+    gaps: &[(usize, Pixels)],
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
@@ -894,14 +910,15 @@ fn paint_line_background(
                         }
                     }
 
+                    let gap = gap_at(gaps, glyph.index);
                     glyph_origin.x = aligned_origin_x(
                         origin,
                         align_width.unwrap_or(layout.width),
-                        glyph.position.x,
+                        glyph.position.x - gap,
                         &align,
                         layout,
                         wraps.peek(),
-                    );
+                    ) + gap;
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;
@@ -1418,6 +1435,7 @@ mod tests {
                             glyph_ix: 2,
                         }]),
                         wrap_width: Some(px(16.)),
+                        gaps: SmallVec::new(),
                     }),
                     text: line.text,
                     decoration_runs: line.decoration_runs.into_vec(),
@@ -1437,6 +1455,7 @@ mod tests {
                     Some(px(16.)),
                     &wrapped.decoration_runs,
                     &wrapped.wrap_boundaries,
+                    &wrapped.gaps,
                     None,
                     window,
                     cx,
