@@ -845,6 +845,19 @@ impl StateInner {
     /// Re-anchor a pending scroll adjustment from a remeasure onto a newly set
     /// scroll position, so it clamps to the remeasured item's new height on
     /// the next layout instead of reverting the scroll.
+    /// Whether scrolling a bottom-aligned list to `top` of at most `max` reaches its end. Items
+    /// not yet measured count as no height, so the bottom of those measured is the end only when
+    /// none below it wait to be measured; items just added under a reader at the bottom would
+    /// otherwise put the reader past them.
+    fn reaches_end(&self, top: Pixels, max: Pixels) -> bool {
+        if self.alignment != ListAlignment::Bottom || top != max {
+            return false;
+        }
+        let mut cursor = self.items.cursor::<ListItemSummary>(());
+        cursor.seek(&Height(top), Bias::Right);
+        !cursor.suffix().summary().has_unknown_height
+    }
+
     fn rebase_pending_scroll(&mut self, scroll_top: ListOffset) {
         let Some(pending) = self.pending_scroll.take() else {
             return;
@@ -917,7 +930,7 @@ impl StateInner {
             .max(px(0.))
             .min(scroll_max);
 
-        if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
+        if self.reaches_end(new_scroll_top, scroll_max) {
             self.pending_scroll = None;
             self.logical_scroll_top = None;
         } else {
@@ -1400,7 +1413,7 @@ impl StateInner {
 
         self.follow_state.stop_following();
 
-        if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
+        if self.reaches_end(new_scroll_top, scroll_max) {
             self.pending_scroll = None;
             self.logical_scroll_top = None;
         } else {
